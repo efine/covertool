@@ -6,6 +6,15 @@
 %% application entry point
 -export([generate_report/2]).
 
+%% rebar3 callbacks
+-export([init/1]).
+
+%% rebar2 callbacks
+-export([eunit/2, ct/2]).
+
+%% mix callbacks
+-export([start/2]).
+
 -include("covertool.hrl").
 -include_lib("xmerl/include/xmerl.hrl").
 
@@ -18,9 +27,7 @@
 main([]) ->
     usage();
 main(Args) ->
-    Config = process_args(Args, #config{appname = 'Application',
-                                        sources = "src/",
-                                        beams = "ebin/"}),
+    Config = process_args(Args, #config{}),
     CoverData = Config#config.cover_data,
     io:format("Importing '~s' data file...~n", [CoverData]),
     cover:import(CoverData),
@@ -30,14 +37,33 @@ main(Args) ->
     io:format("Done.~n"),
     ok.
 
+%% Plugin callbacks
+
+%% Rebar3 plugin registration callback
+init(State) ->
+    rebar3_covertool_gen:init(State).
+
+%% Rebar plugin callbacks
+eunit(Config, AppFile) ->
+    rebar_covertool:eunit(Config, AppFile).
+
+ct(Config, AppFile) ->
+    rebar_covertool:ct(Config, AppFile).
+
+%% Mix callbacks
+start(CompilePath, Opts) ->
+    mix_covertool:start(CompilePath, Opts).
+
+%% End of plugin callbacks
+
 usage() ->
     ScriptName = escript:script_name(),
     io:format("Usage: ~s [Options]~n", [ScriptName]),
     io:format("Options:~n"),
     io:format("    -cover   CoverDataFile  Path to the cover exported data set (default: \"all.coverdata\")~n"),
     io:format("    -output  OutputFile     File to put generated report to (default: \"coverage.xml\")~n"),
-    io:format("    -src     SourceDir      Directory to look for sources (default: \"src\")~n"),
     io:format("    -ebin    EbinDir        Directory to look for beams (default: \"ebin\")~n"),
+    io:format("    -src     SourceDir      Directory to look for sources (default: \"src\")~n"),
     io:format("    -prefix  PrefixLen      Length used for package name (default: 0)~n"),
     io:format("    -appname AppName        Application name to put in the report (default: \"Application\")~n"),
     ok.
@@ -56,9 +82,9 @@ update_config(cover, Value, Config) ->
 update_config(output, Value, Config) ->
     Config#config{output = Value};
 update_config(src, Value, Config) ->
-    Config#config{sources = Value};
+    Config#config{sources = string:tokens(Value, ",")};
 update_config(ebin, Value, Config) ->
-    Config#config{beams = Value};
+    Config#config{beams = string:tokens(Value, ",")};
 update_config(prefix, Value, Config) ->
     Config#config{prefix_len = list_to_integer(Value)};
 update_config(appname, Value, Config) ->
@@ -83,7 +109,7 @@ generate_report(Config, Modules) ->
     Prolog = ["<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
               "<!DOCTYPE coverage SYSTEM \"http://cobertura.sourceforge.net/xml/coverage-04.dtd\">\n"],
 
-    {MegaSecs, Secs, MicroSecs} = now(),
+    {MegaSecs, Secs, MicroSecs} = os:timestamp(),
     Timestamp = MegaSecs * 1000000000 + Secs * 1000 + (MicroSecs div 1000), % in milliseconds
 
     Version = "1.9.4.1", % emulate Cobertura 1.9.4.1
@@ -96,7 +122,8 @@ generate_report(Config, Modules) ->
     {BranchesCovered, BranchesValid} = Result#result.branches,
     BranchRate = rate(Result#result.branches),
 
-    Sources = filename:absname(get(src)),
+    Sources = [{source, [filename:absname(SrcDir)]} || SrcDir <- get(src)],
+
     Root = {coverage, [{timestamp, Timestamp},
                        {'line-rate', LineRate},
                        {'lines-covered', LinesCovered},
@@ -106,7 +133,7 @@ generate_report(Config, Modules) ->
                        {'branches-valid', BranchesValid},
                        {complexity, Complexity},
                        {version, Version}],
-            [{sources, [{source, [Sources]}]},
+            [{sources, Sources},
              {packages, Result#result.data}]},
     Report = xmerl:export_simple([Root], xmerl_xml, [{prolog, Prolog}]),
     write_output(Report, Output),
@@ -138,7 +165,7 @@ generate_packages(AppName, PrefixLen, Modules) ->
 %% - module prefix (name divided by "_")
 package_name(AppName, PrefixLen, Module)
     when is_atom(AppName), is_atom(Module) ->
-
+    AppNameStr = atom_to_list(AppName),
     SourceDirs = case lookup_source(Module) of
                     false ->
                         [];
@@ -157,7 +184,7 @@ package_name(AppName, PrefixLen, Module)
                      lists:sublist(string:tokens(atom_to_list(Module), "_"),
                                    PrefixLen)
              end,
-    string:join([atom_to_list(AppName)] ++ SourceDirs ++ Prefix, ".").
+    string:join([AppNameStr] ++ SourceDirs ++ Prefix, ".").
 
 generate_package(PackageName, Modules) ->
     Classes = generate_classes(Modules),
@@ -259,31 +286,47 @@ sum({Covered1, Valid1}, {Covered2, Valid2}) ->
     {Covered1 + Covered2, Valid1 + Valid2}.
 
 rate({_Covered, 0}) -> "0.0";
-rate({Covered, Valid}) -> [Res] = io_lib:format("~f", [Covered / Valid]), Res.
+rate({Covered, Valid}) -> float_to_list(Covered / Valid, [{decimals, 3}, compact]).
 
 % lookup source in source directory
 lookup_source(Module) ->
-    Sources = get(src),
-    Glob = "^" ++ atom_to_list(Module) ++ "\.erl\$",
-    Fun = fun (Name, _In) ->
-                   % substract directory
-                   case lists:prefix(Sources, Name) of
-                       true -> lists:nthtail(length(Sources), Name);
-                       false -> Name
-                   end
-          end,
-    Name = filelib:fold_files(Sources, Glob, true, Fun, false),
-    case Name of
-        false -> false;
-        [$/ | Relative] -> Relative;
-        _Other -> Name
-    end.
+    lookup_source(get(ebin), Module).
+
+lookup_source([EbinDir | RDirs], M) ->
+    Beam = io_lib:format("~s/~s.beam", [EbinDir, M]),
+    case beam_lib:chunks(Beam, [compile_info]) of
+        {ok, {M, [{compile_info, CompileInfo}]}} ->
+            AbsPath = proplists:get_value(source, CompileInfo),
+            relative_to_src_path(AbsPath);
+        _ ->
+            lookup_source(RDirs, M)
+    end;
+lookup_source(_, _) ->
+    false.
+
+relative_to_src_path(AbsPath) ->
+    Src = get(src),
+    relative_to_src_path(Src, AbsPath).
+
+relative_to_src_path([SrcDir|RDirs], AbsPath) ->
+    case lists:prefix(SrcDir, AbsPath) of
+        true -> ensure_relative_path(lists:nthtail(length(SrcDir), AbsPath));
+        false -> relative_to_src_path(RDirs, AbsPath)
+    end;
+relative_to_src_path([], AbsPath) ->
+    AbsPath.
+
+ensure_relative_path([$/ | RelPath]) -> RelPath;
+ensure_relative_path(RelPath) -> RelPath.
 
 % lookup start and end lines for function
 function_range({M, F, A}) ->
-    Beam = io_lib:format("~s/~s.beam", [get(ebin), M]),
+    function_range(get(ebin), M, F, A).
+
+function_range([EbinDir | RDirs], M, F, A) ->
+    Beam = io_lib:format("~s/~s.beam", [EbinDir, M]),
     case beam_lib:chunks(Beam, [abstract_code]) of
-        {error, beam_lib, _} -> {0, 0};
+        {error, beam_lib, _} -> function_range(RDirs, M, F, A);
         {ok, {M, [{abstract_code, no_abstract_code}]}} -> {0, 0};
         {ok, {M, [{abstract_code, {_Version, AC}}]}} ->
             Filter = fun ({function, _, Fun, Ary, _}) ->
@@ -294,10 +337,14 @@ function_range({M, F, A}) ->
                 [] -> {0, 0}; %% Should never happen unless beam is out of sync
                 [{_, Line, F, A, _}] -> {Line, Line};
                 [{_, Line, F, A, _}, {eof, Next}] -> {Line, Next};
-                [{_, Line, F, A, _}, Following | _] ->
-                    {Line, element(2, Following) - 1}
+                [{_, Line, F, A, _}, {_, N, _, _, _} | _] when is_integer(N) ->
+                    {Line, N - 1};
+                [{_, Line, F, A, _} | _] ->
+                    {Line, Line}
             end
-    end.
+    end;
+function_range(_, _M, _F, _A) ->
+    {0, 0}.
 
 % filter lines by function
 function_lines(MFA, LinesData) ->
